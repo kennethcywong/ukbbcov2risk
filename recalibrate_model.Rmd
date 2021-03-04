@@ -1,0 +1,491 @@
+---
+title: "covid19"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(devtools)
+install.packages("xgboost")
+```
+
+
+
+```{r Define recalibrate function}
+
+source('/home/kenneth/RA/cali_tutorial/hosmer_lemeshow.R')
+source('/home/kenneth/RA/cali_tutorial/mce_ece.R')
+source('/home/kenneth/RA/covid19/reliability_diagram.R')
+
+library(betacal)
+
+measure_cal_func = function(df.result, n_group, type, outfile, g_title){
+
+  prob <- df.result$clinical_risk
+  y <- as.integer(df.result$outcome == "case")
+
+  H_L.pval <-hosmer_lemeshow(y, prob, n_group, type)
+  ece.mce <- ece_mce(y, prob, n_group, type)
+  ECE <- ece.mce[[1]]
+  MCE <- ece.mce[[2]]
+
+  print(paste0('Hosmer-lemeshow p-val: ', H_L.pval,
+               ', ECE: ', ECE,
+               ', MCE: ', MCE))
+
+  reliability_diagram(as.vector(y),
+                  list(as.vector(prob)),
+                  type,
+                  c(g_title),
+                  c('blue'),
+                  outfile)
+}
+
+
+
+platt_recal_func = function(model_fit, cali_data, test_data){
+
+  cali_data.num <- sapply(cali_data[,-length(cali_data)], as.numeric)
+
+  # Train the calibration model by the calibration dataset with logistic regression
+  val_estimates_norm = predict(model_fit, as.matrix(cali_data.num))
+  train_re_mtx = cbind(y=as.integer(cali_data$outcome == "case"), yhat=val_estimates_norm)
+  calib.model <- glm(y~yhat, as.data.frame(train_re_mtx), family=binomial)
+
+  # Pre-calibrated predicted probability of test dataset
+  test_data.num <- sapply(test_data[,-length(test_data)], as.numeric)
+  test_res <- predict(model_fit, as.matrix(test_data.num))
+
+  # Calibrated predicted probability of test dataset by the trained logistic regression model
+  ygrid_norm = as.data.frame(test_res)
+  colnames(ygrid_norm) <- c("yhat")
+
+  # recalibrate and measure on test set
+  ygrid_cal = predict(calib.model, ygrid_norm, type='response')
+
+  return(unname(ygrid_cal))
+}
+
+
+iso_recal_func = function(model_fit, cali_data, test_data){
+  
+  cali_data.num <- sapply(cali_data[,-length(cali_data)], as.numeric)
+
+  # Train the calibration model by the calibration dataset with logistic regression
+  val_estimates_norm = predict(model_fit, as.matrix(cali_data.num))
+  train_re_mtx = cbind(y=as.integer(cali_data$outcome == "case"),  yhat=val_estimates_norm)
+
+  iso_train_mtx = train_re_mtx[order(train_re_mtx[,2]),]
+
+  # create calibration model
+  calib.model <- isoreg(iso_train_mtx[,2], iso_train_mtx[,1])
+  stepf_data = cbind(calib.model$x, calib.model$yf)
+  step_func = stepfun(stepf_data[,1], c(0, stepf_data[,2]))
+
+  # Pre-calibrated predicted probability of test dataset
+  test_data.num <- sapply(test_data[,-length(test_data)], as.numeric)
+  test_res <- predict(model_fit, as.matrix(test_data.num))
+
+  # recalibrate and measure on test set
+  exp2_iso_recal <- step_func(test_res)
+
+  ## draw iso fit func
+  # browser()
+  #iso_func_draw(validate_data, val_estimates_norm, calib.model)
+  ####
+
+  return(exp2_iso_recal)
+}
+
+
+beta_recal_func = function(model_fit, cali_data, test_data, b_param){
+
+  cali_data.num <- sapply(cali_data[,-length(cali_data)], as.numeric)
+
+  # Train the calibration model by the calibration dataset with logistic regression
+  val_estimates_norm = predict(model_fit, as.matrix(cali_data.num))
+  calib.model <- beta_calibration(val_estimates_norm, as.integer(cali_data$outcome == "case"), b_param)
+  
+  # Pre-calibrated predicted probability of test dataset
+  test_data.num <- sapply(test_data[,-length(test_data)], as.numeric)
+  test_res <- predict(model_fit, as.matrix(test_data.num))
+
+  # recalibrate and measure on test set
+  recal_prob = beta_predict(test_res, calib.model)
+ 
+  return(recal_prob)
+}
+
+```
+
+
+```{r calibration performance}
+library(pROC)
+library(plyr)
+library(pscl)
+library(xgboost)
+library(caret)
+library(e1071)
+library(reshape2)
+
+version <- "14Dec2020"
+#run.ver <- "5Jan2021"
+run.ver <- "paper_lite"
+
+set.seed(32)
+output_path <- paste0("/home/kenneth/out/UKBB/covid19/rerun_", run.ver, "/recal")
+datapath <- paste0("/home/kenneth/out/UKBB/covid19/rerun_", run.ver)
+cohort = "D"
+
+setwd(output_path)
+
+# Load the predicted probability from previous built xgboost model
+df.out.final.sorted <- read.csv(paste0(datapath, "/cohort", cohort, "_clinical_risk.tsv"),
+                                header=TRUE, stringsAsFactors=FALSE, quote="\"", sep="\t")
+
+n_group = 10
+type = 'H'
+
+
+# Before prediction model calibration
+measure_cal_func(df.out.final.sorted, n_group, type, 
+                 paste0("Reliability_diagram_beforeCal_cohort", cohort, ".png"),
+                 paste0("Cohort ", cohort, ": No calibration"))
+
+
+```
+
+
+```{r Recalibrate Model}
+
+N_folds <- 5
+
+# Load the training and testing dataset for training the previous xgboost model
+# Variables loaded: xgb.models, trainData_list, testData_list
+load(file=paste0(datapath, "/xgb_model/cohort", cohort, "_XGBModels",".RData"))
+
+# Tune the hyperparameters of XGBoost model for each training set
+params_best <- list()
+for(i in 1:N_folds){
+  df.train = trainData_list[[i]]
+
+  # Set label
+  xgb.train.label <- as.integer(df.train$outcome == "case")
+
+  # Convert dataframe to numeric type
+  df.train.num <- sapply(df.train[,1:ncol(df.train)-1], as.numeric)
+
+  # Convert dataframe to matrix type
+  dtrain <- xgb.DMatrix(data=as.matrix(df.train.num), label=xgb.train.label)
+
+  # HyperParameters tuning by formal grid search
+  # https://stats.stackexchange.com/questions/171043/how-to-tune-hyperparameters-of-xgboost-trees
+  # XGBoost task parameters
+  nrounds <- 80
+  folds <- 5
+  obj <- 'binary:logistic'
+
+  library("NMOF")
+  paramsA <- list(
+    eta = c(0.15,0.2,0.25),
+    max_depth = 2:4,
+    # max_delta_step = c(0,1),
+    gamma= c(0.5,1,1.5),
+    lambda= c(3,5,10), #L2 penalty
+    alpha= c(8,10,15), #L1 penalty
+    nthread=4,
+    subsample = 1
+  )
+  
+  
+  # Cohort B
+  ## Logloss
+  paramsB <- list(
+    eta = c(0.05, 0.1,0.2),
+    max_depth = 2:3,
+    # max_delta_step = c(0,1),
+    gamma= c(0.1, 1, 5),
+    lambda= c(1,5,10), #L2 penalty
+    alpha= c(6,12,15), #L1 penalty
+    nthread=4,
+    subsample = 1
+  )
+  
+  # Cohort C
+  paramsC <- list(
+    eta = c(0.2),
+    tree_method = c("hist"),
+    max_depth = c(5,6),
+    max_delta_step = c(0),
+    min_child_weight = c(5,8),
+    gamma= c(0.1, 0.01),
+    lambda= c(5), #L2 penalty
+    alpha= c(15), #L1 penalty
+    scale_pos_weight = sqrt(469255/1634),
+    nthread=4,
+    subsample = 1
+  )
+
+  # Cohort D
+  paramsD <- list(
+    eta = c(0.2),
+    tree_method = c("hist"),
+    max_depth = c(5,6),
+    max_delta_step = c(0),
+    min_child_weight = c(5,8),
+    gamma= c(0.1, 0.01),
+    lambda= c(5), #L2 penalty
+    alpha= c(15), #L1 penalty
+    scale_pos_weight = sqrt(469255/419),
+    nthread=4,
+    subsample = 1
+  )
+    
+  if(cohort == "A"){
+    params <- paramsA
+  } else if (cohort == "B"){
+    params <- paramsB
+  } else if (cohort == "C"){
+    params <- paramsC
+  } else if (cohort == "D"){
+    params <- paramsD
+  }
+
+  
+  library(parallel)
+  # Table to track performance from each worker node
+  res <- data.frame()
+
+  # Simple cross validated XGboost training function (returning minimum error for grid search)
+  # Here we only use the training set for finding best tuning parameters
+  xgbCV <- function (search_params) {
+    fit <- xgb.cv(
+      data = as.matrix(df.train.num),
+      label = xgb.train.label,
+      param = search_params,
+      missing = NA,
+      nfold = folds,
+      objective = obj,
+      prediction = FALSE,
+      early_stopping_rounds = 20,
+      maximize = TRUE,
+      metrics = c("auc"), #c("logloss"),
+      nrounds = nrounds,
+      stratified=T,
+      print_every_n=10
+    )
+
+    fit_df = fit$evaluation_log
+    fit_params = fit$params
+    rounds <- nrow(fit_df)
+    metric <- ifelse(fit_params$eval_metric=="auc","test_auc_mean", "test_logloss_mean")
+    # metric = "test_auc_mean"  #"test_logloss_mean"    #paste('test.',eval,'.mean',sep='')
+    # metric = "test_logloss_mean"
+    if (metric =="test_logloss_mean") {
+      idx <- which.min(fit_df[,fit_df[[metric]]])
+      retval <- fit_df[idx,][[metric]]
+    }
+    if (metric =="test_auc_mean") {
+      idx <- which.max(fit_df[,fit_df[[metric]]])
+      retval <- 1.0 - fit_df[idx,][[metric]]
+    }
+    val <- fit_df[idx,][[metric]]
+
+    res <<- rbind(res,c(idx,val,metric,rounds))
+    colnames(res) <<- c('idx','val','metric','rounds')
+
+    return(retval)
+
+  }
+
+  # Find minimal testing error in parallel
+  cl <- makeCluster(5)     #(round(detectCores()/2))
+
+  library(doParallel)
+  registerDoParallel(cl)
+  clusterExport(cl, c("xgb.cv","df.train.num", "xgb.train.label",
+                      "nrounds", "obj","res","eval","folds","params"))
+
+  t1= proc.time()
+  sol <- gridSearch(
+    fun = xgbCV,
+    levels = params,
+    method =  'snow', #"multicore",
+    cl = cl,
+    #mc.control = list(mc.cores=8),
+    keepNames = TRUE,
+    asList = TRUE
+  )
+  proc.time()-t1
+
+  # Combine all model results
+  comb=clusterEvalQ(cl,res)
+  results <- ldply(comb,data.frame)
+  stopCluster(cl)
+  params_best <- append(params_best, list(sol$minlevels))
+  # results
+}
+# ____________________end of parameter tuning_________________________
+
+```
+
+
+
+```{r recalibrate model}
+setwd(output_path)
+
+# Build the XGB Model for K-fold CV
+df.out.final <- data.frame()
+df.out.final.platt_recal <- data.frame()
+df.out.final.iso_recal <- data.frame()
+df.out.final.beta_recal <- data.frame()
+pred.auc <- c()
+xgb.models <- list()
+df.cali_list <- list()
+
+
+
+if (cohort == "C" || cohort == "D") {
+  beta_param <- "am"
+} else {
+  beta_param <- "abm"
+}
+
+for(i in 1:N_folds){
+  train.idx <- sample(nrow(trainData_list[[i]]), 3/4 * nrow(trainData_list[[i]]))
+  df.train <- trainData_list[[i]][train.idx,]
+  df.cali <- trainData_list[[i]][-train.idx,]
+  df.test <- testData_list[[i]]
+  print(paste0("dim(cali):", dim(df.cali)[1], ", dim(df.train):", dim(df.train)[1], ", dim(df.test):", dim(df.test)[1]))
+
+  # Further split train set to train and validation set
+  train1.idx <- sample(nrow(df.train), 4/5 * nrow(df.train))
+  df.train1 <- df.train[train1.idx,]
+  df.train2 <- df.train[-train1.idx,]
+
+  # Set label
+  xgb.train.label <- as.integer(df.train$outcome == "case")
+  xgb.train1.label <- as.integer(df.train1$outcome == "case")
+  xgb.train2.label <- as.integer(df.train2$outcome == "case")
+  xgb.test.label <- as.integer(df.test$outcome == "case")
+
+  # Convert dataframe to numeric type
+  df.train.num <- sapply(df.train[,1:ncol(df.train)-1], as.numeric)
+  df.train1.num <- sapply(df.train1[,1:ncol(df.train1)-1], as.numeric)
+  df.train2.num <- sapply(df.train2[,1:ncol(df.train2)-1], as.numeric)
+  df.test.num <- sapply(df.test[,1:ncol(df.test)-1], as.numeric)
+
+  # Convert dataframe to matrix type
+  dtrain <- xgb.DMatrix(data=as.matrix(df.train.num), label=xgb.train.label)
+  dtrain1 <- xgb.DMatrix(data=as.matrix(df.train1.num), label=xgb.train1.label)
+  dtrain2 <- xgb.DMatrix(data=as.matrix(df.train2.num), label=xgb.train2.label)
+  dtest <- xgb.DMatrix(data=as.matrix(df.test.num), label=xgb.test.label)
+  watchlist <- list(train=dtrain1, test=dtrain2)
+
+  # Find the optimium iteration
+  xgbcv <- xgb.cv(params=params_best[[i]], data=dtrain1, label = NULL,
+                  nrounds=nrounds, nfold=5, showsd=T,
+                  stratified=T, print,every.n=10,
+                  early_stopping_rounds=20, maximize=T,
+                  eval_metric="auc")
+
+  # Build model
+  xgb <- xgb.train(data=dtrain1, watchlist=watchlist,
+                   params=params_best[[i]],# nthread=20,
+                   nrounds=xgbcv$best_iteration,
+                   objective="binary:logistic",
+                   eval_metric="auc", verbose=2)
+  xgb.models <- append(xgb.models, list(xgb))
+  df.cali_list <- append(df.cali_list, list(df.cali))
+
+  # Evaluate testing AUC
+  test.xgb <- predict(xgb, as.matrix(df.test.num))
+
+  pred.roc <- roc(xgb.test.label, test.xgb, direction="<",
+                  plot=TRUE, percent=TRUE, ci=TRUE,
+                  ci.alpha=0.95, grid=TRUE,
+                  print.auc=TRUE, show.thres=TRUE)
+  
+  pred.auc <- c(pred.auc, auc(pred.roc))
+
+  # Recalibration of predicted probability of test dataset by the calibration dataset
+  platt_recal_test <- platt_recal_func(xgb, df.cali, df.test)
+  iso_recal_test <- iso_recal_func(xgb, df.cali, df.test)
+  beta_recal_test <- beta_recal_func(xgb, df.cali, df.test, beta_param)
+  
+  # Create dataframe for subjects in test set and sorted by predicted clinical risk
+  df.out.test <- df.test["outcome"]
+  df.out.test$clinical_risk <- test.xgb
+  df.out.test$eid <- row.names(df.out.test)
+
+  # Append the subjects with clinical risk to dataframe
+  df.out.final <- rbind(df.out.final, df.out.test)
+
+  df.out.final.test <- df.test["outcome"]
+  df.out.final.test$clinical_risk <- platt_recal_test
+  df.out.final.test$eid <- row.names(df.out.final.test)
+  df.out.final.platt_recal <- rbind(df.out.final.platt_recal, df.out.final.test)
+
+  df.out.final.test <- df.test["outcome"]
+  df.out.final.test$clinical_risk <- iso_recal_test
+  df.out.final.test$eid <- row.names(df.out.final.test)
+  df.out.final.iso_recal <- rbind(df.out.final.iso_recal, df.out.final.test)
+  
+  df.out.final.test <- df.test["outcome"]
+  df.out.final.test$clinical_risk <- beta_recal_test
+  df.out.final.test$eid <- row.names(df.out.final.test)
+  df.out.final.beta_recal <- rbind(df.out.final.beta_recal, df.out.final.test)
+
+}  
+
+
+# Print the Average AUC performance metric
+print(paste0("Avg Testing AUC of 5 fold CV set is ", round(mean(pred.auc),1), "%"))
+
+# Save the xgb trained model and the calibration dataset
+save(xgb.models, df.cali_list, file=paste0("cohort", cohort, "_CaliModels.Rdata"))
+
+# Save the subjects with sorted clinical risk to file
+df.out.final.sorted <- df.out.final[order(-df.out.final[,2]),]
+write.table(df.out.final.sorted[,c("eid","clinical_risk","outcome")],
+            paste0("cohort", cohort, "_clinical_risk.tsv"),
+            row.names=FALSE, quote=FALSE, sep="\t")
+
+df.out.final.platt_recal.sorted <- df.out.final.platt_recal[order(-df.out.final.platt_recal[,2]),]
+write.table(df.out.final.platt_recal.sorted[,c("eid","clinical_risk","outcome")],
+            paste0("cohort", cohort, "_clinical_risk.platt_recal.tsv"),
+            row.names=FALSE, quote=FALSE, sep="\t")
+
+df.out.final.iso_recal.sorted <- df.out.final.iso_recal[order(-df.out.final.iso_recal[,2]),]
+write.table(df.out.final.iso_recal.sorted[,c("eid","clinical_risk","outcome")],
+            paste0("cohort", cohort, "_clinical_risk.iso_recal.tsv"),
+            row.names=FALSE, quote=FALSE, sep="\t")
+
+df.out.final.beta_recal.sorted <- 
+df.out.final.beta_recal[order(-df.out.final.beta_recal[,2]),]
+write.table(df.out.final.beta_recal.sorted[,c("eid","clinical_risk","outcome")],
+            paste0("cohort", cohort, "_clinical_risk.beta_recal.tsv"),
+            row.names=FALSE, quote=FALSE, sep="\t")
+
+```
+
+```{r re-calibration performance}
+setwd(output_path)
+
+n_group = 10
+type = 'H'
+
+# After prediction model calibration
+measure_cal_func(df.out.final.platt_recal.sorted, n_group, type,
+                 paste0("Reliability_diagram_afterPlattCal_cohort", cohort, ".png"),
+                 paste0("Cohort ", cohort, ": Adjusted by Platt Scaling"))
+
+measure_cal_func(df.out.final.iso_recal.sorted, n_group, type, 
+                 paste0("Reliability_diagram_afterIsoCal_cohort", cohort, ".png"),
+                 paste0("Cohort ", cohort, ": Adjusted by Isotonic regression"))
+
+measure_cal_func(df.out.final.beta_recal.sorted, n_group, type, 
+                 paste0("Reliability_diagram_afterBetaCal_cohort", cohort, ".png"),
+                 paste0("Cohort ", cohort, ": Adjusted by Beta calibration"))
+```
+

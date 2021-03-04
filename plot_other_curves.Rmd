@@ -1,0 +1,111 @@
+
+```{r}
+#_______________________________________________
+# Plot other curves
+#________________________________________________
+require(pROC)
+library(rmda)
+library(PRROC)
+library(PredictABEL)
+
+#run.ver <- "5Jan2021"
+run.ver <- "30Dec2020"
+
+datapath <- paste0("/home/kenneth/out/UKBB/covid19/rerun_", run.ver, "/recal")
+outpath <-  paste0("/home/kenneth/out/UKBB/covid19/rerun_", run.ver, "/recal")
+
+setwd(outpath) 
+
+cohorts <- c('A', 'B', 'C', 'D')
+
+df_risk.nocal <- list()
+df_risk.beta <- list()
+for (i in 1:length(cohorts)) {
+  df_risk.nocal[[i]] <- read.csv(paste0("cohort", cohorts[i], "_clinical_risk.tsv"),
+                           header = TRUE, stringsAsFactors=FALSE, sep="\t")
+  df_risk.beta[[i]] <- read.csv(paste0("cohort", cohorts[i], "_clinical_risk.beta_recal.tsv"),
+                           header = TRUE, stringsAsFactors=FALSE, sep="\t")
+
+  df_risk.nocal[[i]]$outcome <- as.integer(df_risk.nocal[[i]]$outcome == "case")
+  df_risk.beta[[i]]$outcome <- as.integer(df_risk.beta[[i]]$outcome == "case")
+}
+```
+
+```{r}
+#____________________________________
+# Plot ROC curve
+#___________________________________
+plotROC <- function(Real_status_indexes, risks, metadata, auc, outpath, outfile, title) {
+  n = length(metadata)
+  graphs = vector(mode="list", length=n)
+  for (i in 1:n) {
+    graphs[[i]] = roc.curve(scores.class0=risks[[i]], weights.class0=Real_status_indexes[[i]], curve=TRUE)
+  }
+
+  png(file.path(outpath, paste0("ROC_", outfile, ".png")))
+
+  colors = c("red", "green", "cyan", "purple")
+  plot(graphs[[1]], max.plot=TRUE, min.plot=TRUE, rand.plot=F, lwd=0.7,
+       fill.area = F, color=colors[1], main=paste0("ROC curve - ", title), auc.main=F, legend=T)
+  for (i in 2:n){
+    plot(graphs[[i]], lwd=0.7, add = TRUE, color=colors[i], legend=T)
+  }
+  auc_3fp = mapply(function(m,f) {return(paste0(m, " (auc=", sprintf("%.3f", f), ")"))}, metadata[1:n], auc[1:n])
+  legend("bottomright", legend=auc_3fp[1:n], col=colors[1:n], lty=rep(1,n), cex=0.8)       
+  dev.off()
+}
+
+#____________________________________
+# Plot Decision curve
+#___________________________________
+plotDecisionCurve <- function(df_risks, metadata, outpath, outfile, title) {
+  n = length(metadata)
+  results <- list()
+  thres_seq = seq(0, 0.999, length = 1000)
+  for (i in 1:n) {
+    results[[i]] <- decision_curve(formula=as.formula("outcome ~ clinical_risk"),
+                                   data=df_risks[[i]], policy = "opt-in", fitted.risk = TRUE,
+                                   thresholds = thres_seq, confidence.intervals = NA,
+                                   bootstraps = 500, study.design = "cohort")
+  }
+
+  png(file.path(outpath, paste0("DC_", outfile, ".png")))
+  plot_decision_curve(results, curve.names=metadata[1:n],
+                      xlim = c(0, 1), ylim = c(-1,1), lwd=0.7, main = paste0("Decision Curve - ", title),
+                      legend.position = "bottomright", cex=0.8)
+  dev.off()
+
+}
+```
+
+```{r}
+aucs.nocal <- list()
+aucs.beta <- list()
+for (i in 1:length(cohorts)) {
+  aucs.nocal[[i]] <- auc(df_risk.nocal[[i]]$outcome, df_risk.nocal[[i]]$clinical_risk)
+  aucs.beta[[i]] <- auc(df_risk.beta[[i]]$outcome, df_risk.beta[[i]]$clinical_risk)
+}
+outcomes.nocal <- lapply(df_risk.nocal, "[", , c("outcome"))
+outcomes.beta <- lapply(df_risk.beta, "[", , c("outcome"))
+risks.nocal <- lapply(df_risk.nocal, "[", , c("clinical_risk"))
+risks.beta <- lapply(df_risk.beta, "[", , c("clinical_risk"))
+metadata <- c("CohortA", "CohortB", "CohortC", "CohortD")
+
+plotROC(outcomes.nocal, risks.nocal, metadata, aucs.nocal, outpath, "no_cali", "No calibration")
+plotROC(outcomes.beta, risks.beta, metadata, aucs.beta, outpath, "beta_cali", "Beta calibration")
+
+plotDecisionCurve(df_risk.nocal, metadata, outpath, "no_cali", "No Calibration")
+plotDecisionCurve(df_risk.beta, metadata, outpath, "beta_cali", "Beta calibration")
+
+# Plot Predictiveness Curve
+for (i in 1:length(cohorts)) {
+  png(file.path(outpath, paste0("PC_cohort", cohorts[i], ".png")))
+  plotPredictivenessCurve(predrisk=cbind(risks.nocal[[i]], risks.beta[[i]]),
+                          labels=c(paste0("No Calibration"), 
+                                   paste0("Beta Calibration")),
+                          plottitle=paste0("Predictiveness Curve - Cohort ", cohorts[i]))
+  dev.off()
+}
+
+```
+
